@@ -74,6 +74,8 @@ def build_planner_message(
     vr_3pt_position: Sequence[float] | None = None,
     vr_3pt_orientation: Sequence[float] | None = None,
     vr_3pt_compliance: Sequence[float] | None = None,
+    left_gripper: float | None = None,
+    right_gripper: float | None = None,
 ) -> bytes:
     """
     Assemble a 'planner' topic message:
@@ -152,6 +154,17 @@ def build_planner_message(
         fields.append({"name": "vr_compliance", "dtype": "f32", "shape": [len(vr_3pt_compliance)]})
         for value in vr_3pt_compliance:
             payload += struct.pack("<f", float(value))
+
+    # 2-finger gripper targets (normalized 0..1, 0=open 1=close). Independent of the
+    # Dex3 left_hand_joints/right_hand_joints fields above; consumed by the DM-gripper
+    # bridge on the robot. Optional/additive -> no version bump needed.
+    if left_gripper is not None:
+        fields.append({"name": "left_gripper", "dtype": "f32", "shape": [1]})
+        payload += struct.pack("<f", float(left_gripper))
+
+    if right_gripper is not None:
+        fields.append({"name": "right_gripper", "dtype": "f32", "shape": [1]})
+        payload += struct.pack("<f", float(right_gripper))
 
     header = _build_header(fields, version=1, count=1)
 

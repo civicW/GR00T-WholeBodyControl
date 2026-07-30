@@ -512,6 +512,48 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     return fingertips
 
 
+def compute_gripper_target(trigger, gain=1.0, invert=False, deadzone=0.05):
+    """Map a Pico trigger value to a 2-finger gripper target (normalized 0..1).
+
+    Returns normalized in [0,1]: 0 = fully open, 1 = fully closed.
+    This is independent of the Dex3 hand path above (generate_finger_data); the
+    value is consumed by the DM-gripper bridge on the robot, which maps it to the
+    motor angle range.
+
+    - gain>1 reaches full travel before full trigger deflection.
+    - invert flips direction (trigger press -> open instead of close).
+    - deadzone suppresses small trigger noise (same style as the joystick deadzone).
+    """
+    t = 0.0 if trigger is None else float(np.clip(trigger, 0.0, 1.0))
+    t_eff = 0.0 if t < deadzone else (t - deadzone) / (1.0 - deadzone)
+    g = float(np.clip(gain * t_eff, 0.0, 1.0))
+    return (1.0 - g) if invert else g
+
+
+class GripperCfg:
+    """Config for trigger->gripper mapping (shared gain/deadzone, per-side invert)."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        gain: float = 1.0,
+        deadzone: float = 0.05,
+        invert_left: bool = False,
+        invert_right: bool = False,
+    ):
+        self.enabled = enabled
+        self.gain = gain
+        self.deadzone = deadzone
+        self.invert_left = invert_left
+        self.invert_right = invert_right
+
+    def target_left(self, trigger):
+        return compute_gripper_target(trigger, self.gain, self.invert_left, self.deadzone)
+
+    def target_right(self, trigger):
+        return compute_gripper_target(trigger, self.gain, self.invert_right, self.deadzone)
+
+
 # Joystick deadzone threshold
 JOYSTICK_DEADZONE = 0.15
 
@@ -1176,8 +1218,10 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        gripper_cfg: GripperCfg | None = None,
     ):
         self.socket = socket
+        self.gripper_cfg = gripper_cfg or GripperCfg()
         self.reader = reader
         self.num_frames_to_send = num_frames_to_send
         self.target_fps = target_fps
@@ -1301,6 +1345,13 @@ class PoseStreamer:
             right_trigger,
             right_grip,
         )
+        # Proportional 2-finger gripper targets (normalized 0..1) for the DM grippers.
+        # Only emitted when --gripper_enable is set (additive fields, backward compatible).
+        if self.gripper_cfg.enabled:
+            l_gripper = self.gripper_cfg.target_left(left_trigger)
+            r_gripper = self.gripper_cfg.target_right(right_trigger)
+        else:
+            l_gripper = r_gripper = 0.0
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1465,6 +1516,10 @@ class PoseStreamer:
                 ),
             }
 
+            if self.gripper_cfg.enabled:
+                numpy_data["left_gripper"] = np.array([l_gripper], dtype=np.float32)
+                numpy_data["right_gripper"] = np.array([r_gripper], dtype=np.float32)
+
             packed_message = pack_pose_message(numpy_data, topic="pose")
             self.socket.send(packed_message)
 
@@ -1625,10 +1680,12 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        gripper_cfg: GripperCfg | None = None,
     ):
         self.socket = socket
         self.reader = reader
         self.three_point = three_point
+        self.gripper_cfg = gripper_cfg or GripperCfg()
         self.feedback_reader = FeedbackReader(
             zmq_feedback_host=zmq_feedback_host, zmq_feedback_port=zmq_feedback_port
         )
@@ -1685,6 +1742,15 @@ class PlannerStreamer:
 
             # A+B => next mode; X+Y => previous mode (rising edges)
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+            # Read triggers/grips once for ALL planner modes (lifted out of the VR_3PT
+            # branch) so 2-finger gripper targets can be emitted in every mode.
+            (
+                _left_menu_button,
+                left_trigger,
+                right_trigger,
+                left_grip,
+                right_grip,
+            ) = get_controller_inputs()
             ab_now = bool(a_pressed) and bool(b_pressed)
             xy_now = bool(x_pressed) and bool(y_pressed)
             if ab_now and not self.prev_ab:
@@ -1753,13 +1819,6 @@ class PlannerStreamer:
 
                 # Compute hand joints from trigger/grip inputs so operator can
                 # control hand open/close while in VR 3PT mode
-                (
-                    left_menu_button,
-                    left_trigger,
-                    right_trigger,
-                    left_grip,
-                    right_grip,
-                ) = get_controller_inputs()
                 lh_joints, rh_joints = compute_hand_joints_from_inputs(
                     self.left_hand_ik_solver,
                     self.right_hand_ik_solver,
@@ -1770,6 +1829,14 @@ class PlannerStreamer:
                 )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+
+            # Proportional 2-finger gripper targets (normalized 0..1) for the DM
+            # grippers. None when disabled -> field omitted (backward compatible).
+            if self.gripper_cfg.enabled:
+                l_gripper = self.gripper_cfg.target_left(left_trigger)
+                r_gripper = self.gripper_cfg.target_right(right_trigger)
+            else:
+                l_gripper = r_gripper = None
 
             msg = build_planner_message(
                 mode_to_send.value,
@@ -1783,6 +1850,8 @@ class PlannerStreamer:
                 vr_3pt_position=vr_3pt_position,
                 vr_3pt_orientation=vr_3pt_orientation,
                 vr_3pt_compliance=vr_3pt_compliance,
+                left_gripper=l_gripper,
+                right_gripper=r_gripper,
             )
             self.socket.send(msg)
         except Exception as e:
@@ -1814,6 +1883,11 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    gripper_enable: bool = False,
+    gripper_gain: float = 1.0,
+    gripper_invert_left: bool = False,
+    gripper_invert_right: bool = False,
+    gripper_deadzone: float = 0.05,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1858,6 +1932,14 @@ def run_pico_manager(
         log_prefix="PoseLoop",
     )
 
+    gripper_cfg = GripperCfg(
+        enabled=gripper_enable,
+        gain=gripper_gain,
+        deadzone=gripper_deadzone,
+        invert_left=gripper_invert_left,
+        invert_right=gripper_invert_right,
+    )
+
     pose_streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -1868,6 +1950,7 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        gripper_cfg=gripper_cfg,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -1876,6 +1959,7 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        gripper_cfg=gripper_cfg,
     )
 
     # State machine diagram:
@@ -2156,6 +2240,34 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--gripper_enable",
+        action="store_true",
+        help="Emit proportional left_gripper/right_gripper (normalized 0..1) from the "
+        "triggers into the pose/planner ZMQ messages. Off by default for backward compat.",
+    )
+    parser.add_argument(
+        "--gripper_gain",
+        type=float,
+        default=1.0,
+        help="Trigger->gripper gain (default 1.0). >1 reaches full travel early.",
+    )
+    parser.add_argument(
+        "--gripper_invert_left",
+        action="store_true",
+        help="Invert left trigger direction (press -> open). Default: press -> close.",
+    )
+    parser.add_argument(
+        "--gripper_invert_right",
+        action="store_true",
+        help="Invert right trigger direction (press -> open). Default: press -> close.",
+    )
+    parser.add_argument(
+        "--gripper_deadzone",
+        type=float,
+        default=0.05,
+        help="Trigger deadzone in [0,1] (default 0.05).",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2196,6 +2308,11 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            gripper_enable=args.gripper_enable,
+            gripper_gain=args.gripper_gain,
+            gripper_invert_left=args.gripper_invert_left,
+            gripper_invert_right=args.gripper_invert_right,
+            gripper_deadzone=args.gripper_deadzone,
         )
     else:
         # Run legacy single-thread pose streaming
