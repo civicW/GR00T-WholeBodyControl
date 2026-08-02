@@ -103,6 +103,15 @@ class SonicDataExporterConfig:
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
 
+    end_effector: str = "none"
+    """End-effector type for EE action/observation features ('none' disables; 'dm_gripper' for DM 2-finger)."""
+
+    ee_feedback_host: str = "192.168.123.200"
+    """ZMQ host of the robot-side EE bridge publishing actual gripper feedback."""
+
+    ee_feedback_port: int = 5558
+    """ZMQ port of the EE bridge feedback (topic 'ee_feedback')."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -227,12 +236,16 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        end_effector: str = "none",
+        ee_feedback_host: str = "192.168.123.200",
+        ee_feedback_port: int = 5558,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
+        self.end_effector = end_effector
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -244,6 +257,11 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        # EE (end-effector) actual feedback from the robot-side bridge: dict
+        # {side: {"norm": float, "angle": float}} or None until first frame.
+        self.latest_ee_actual = None
+        self._ee_angle_range = None  # (open_deg, close_deg) for norm<->angle mapping
+        self._ee_names: list[str] = []
 
         self.current_stream_mode = 0
 
@@ -254,6 +272,33 @@ class GrootDataCollector:
             host=state_zmq_host,
             port=state_zmq_port,
         )
+
+        # EE feedback subscriber (actual gripper norm+angle from the robot bridge).
+        self._ee_zmq_ctx = None
+        self._ee_zmq_socket = None
+        if end_effector != "none":
+            from gear_sonic.data.features_sonic_vla import get_ee_descriptor
+
+            desc = get_ee_descriptor(end_effector)
+            self._ee_angle_range = desc["angle_range"]
+            self._ee_names = list(desc["names"])
+            self._ee_prefix = desc["feature_prefix"]
+            try:
+                self._ee_zmq_ctx = zmq.Context()
+                self._ee_zmq_socket = self._ee_zmq_ctx.socket(zmq.SUB)
+                self._ee_zmq_socket.connect(f"tcp://{ee_feedback_host}:{ee_feedback_port}")
+                self._ee_zmq_socket.setsockopt(zmq.RCVTIMEO, 100)
+                self._ee_zmq_socket.setsockopt(zmq.CONFLATE, 1)
+                self._ee_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "ee_feedback")
+                time.sleep(0.3)
+                print(
+                    f"[EE] {end_effector}: subscribed to ee_feedback at "
+                    f"{ee_feedback_host}:{ee_feedback_port}; "
+                    f"angle_range={self._ee_angle_range}"
+                )
+            except Exception as e:
+                print(f"[EE] Warning: failed to init EE feedback subscriber: {e}")
+                self._ee_zmq_socket = None
 
         self._sonic_zmq_ctx = None
         self._sonic_zmq_socket = None
@@ -304,6 +349,39 @@ class GrootDataCollector:
             msg["ros_timestamp"] = time.time()
 
         self.latest_proprio_msg = msg
+
+    def _poll_ee_feedback(self):
+        """Poll the EE bridge 'ee_feedback' topic for actual gripper norm+angle.
+
+        Wire fields (packed by the DM gripper bridge): per side `<side>` (norm 0..1)
+        and `<side>_angle` (deg). Stores the latest as {side: {"norm","angle"}}.
+        """
+        if self._ee_zmq_socket is None:
+            return
+        raw = None
+        try:
+            while True:  # CONFLATE=1 keeps only latest; drain it
+                raw = self._ee_zmq_socket.recv(zmq.NOBLOCK)
+        except zmq.Again:
+            pass
+        if raw is None or not raw.startswith(b"ee_feedback"):
+            return
+        try:
+            data = unpack_pose_message(raw, topic="ee_feedback")
+        except Exception:
+            return
+        actual: dict[str, dict] = {}
+        for side in self._ee_names:
+            norm = data.get(side)
+            angle = data.get(f"{side}_angle")
+            if norm is None and angle is None:
+                continue
+            actual[side] = {
+                "norm": float(norm.flat[0]) if norm is not None else None,
+                "angle": float(angle.flat[0]) if angle is not None else None,
+            }
+        if actual:
+            self.latest_ee_actual = actual
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -404,6 +482,8 @@ class GrootDataCollector:
             "vr_3pt_orientation": vr_3pt_orientation,
             "left_hand_joints": self._extract_hand_joints(data, "left_hand_joints"),
             "right_hand_joints": self._extract_hand_joints(data, "right_hand_joints"),
+            "left_gripper": self._extract_gripper(data, "left"),
+            "right_gripper": self._extract_gripper(data, "right"),
             "receive_timestamp": time.time(),
         }
 
@@ -462,6 +542,8 @@ class GrootDataCollector:
 
             left_hand_joints = self._extract_hand_joints(pose_data, "left_hand_joints")
             right_hand_joints = self._extract_hand_joints(pose_data, "right_hand_joints")
+            left_gripper = self._extract_gripper(pose_data, "left")
+            right_gripper = self._extract_gripper(pose_data, "right")
 
             vr_3pt_position = None
             if "vr_position" in pose_data and pose_data["vr_position"].size == 9:
@@ -478,6 +560,8 @@ class GrootDataCollector:
                 ),
                 "left_hand_joints": left_hand_joints,
                 "right_hand_joints": right_hand_joints,
+                "left_gripper": left_gripper,
+                "right_gripper": right_gripper,
                 "left_wrist_joints": left_wrist_joints,
                 "right_wrist_joints": right_wrist_joints,
                 "vr_3pt_position": vr_3pt_position,
@@ -500,6 +584,14 @@ class GrootDataCollector:
                 arr = arr[0]
             return arr.astype(np.float32)
         return np.zeros(7, dtype=np.float32)
+
+    @staticmethod
+    def _extract_gripper(pose_data: dict, side: str) -> float:
+        """Normalized gripper target for one side (0=open, 1=close). Default 0.0."""
+        arr = pose_data.get(f"{side}_gripper")
+        if arr is None:
+            return 0.0
+        return float(np.asarray(arr).flat[0])
 
     @staticmethod
     def _extract_bool(pose_data: dict, key: str) -> bool:
@@ -604,6 +696,8 @@ class GrootDataCollector:
             "action.wbc": whole_action_wbc,
         }
 
+        self._add_ee_features(frame_data)
+
         self._add_cpp_state_features(frame_data, proprio)
 
         sonic_latency_ms = self._add_sonic_pose_features(frame_data)
@@ -614,6 +708,47 @@ class GrootDataCollector:
 
         self.data_exporter.add_frame(frame_data)
         return self._finalize_frame(t_start)
+
+    def _add_ee_features(self, frame_data: dict) -> None:
+        """Populate action.ee / action.ee_angle (desired) and observation.ee /
+        observation.ee_angle (actual) when an end-effector type is configured.
+
+        desired norm comes from the teleop stream; desired deg is derived from the
+        EE descriptor angle range (matches the robot-side motor command). actual
+        norm+deg come from the EE bridge feedback (may be 0 until feedback arrives).
+        """
+        if self.end_effector == "none" or self._ee_angle_range is None:
+            return
+        open_deg, close_deg = self._ee_angle_range
+
+        msg = (
+            self.latest_sonic_msg if self.current_stream_mode in (1, 4)
+            else self.latest_planner_msg
+        ) or {}
+        desired = np.array(
+            [float(msg.get(f"{s}_gripper", 0.0)) for s in self._ee_names],
+            dtype=np.float32,
+        )
+        desired_deg = np.array(
+            [open_deg + n * (close_deg - open_deg) for n in desired], dtype=np.float32
+        )
+
+        actual = self.latest_ee_actual or {}
+        actual_norm, actual_deg = [], []
+        for s in self._ee_names:
+            a = actual.get(s, {})
+            an = a.get("norm")
+            ad = a.get("angle")
+            if ad is None and an is not None:
+                ad = open_deg + an * (close_deg - open_deg)
+            actual_norm.append(an if an is not None else 0.0)
+            actual_deg.append(ad if ad is not None else 0.0)
+
+        p = self._ee_prefix
+        frame_data[f"action.{p}"] = desired
+        frame_data[f"action.{p}_angle"] = desired_deg
+        frame_data[f"observation.{p}"] = np.asarray(actual_norm, dtype=np.float32)
+        frame_data[f"observation.{p}_angle"] = np.asarray(actual_deg, dtype=np.float32)
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
         if "base_quat" in proprio:
@@ -866,6 +1001,7 @@ class GrootDataCollector:
                 with self.telemetry.timer("total_loop"):
                     with self.telemetry.timer("poll_state"):
                         self._poll_state_zmq()
+                        self._poll_ee_feedback()
 
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
@@ -924,6 +1060,21 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
+    if config.end_effector != "none":
+        from gear_sonic.data.features_sonic_vla import (
+            get_ee_features,
+            get_ee_modality_config,
+        )
+
+        print(f"[EE] end_effector={config.end_effector} — adding EE features to schema")
+        dataset_features.update(get_ee_features(config.end_effector))
+        ee_modality = get_ee_modality_config(config.end_effector)
+        for key, value in ee_modality.items():
+            if key in modality_config:
+                modality_config[key].update(value)
+            else:
+                modality_config[key] = value
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
@@ -936,8 +1087,47 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_wrist_cameras": config.record_wrist_cameras,
+            "end_effector": config.end_effector,
+        },
     )
+
+    if config.end_effector != "none":
+        # Write EE config + action/state masks DIRECTLY into info.json (top-level),
+        # injected into the in-memory info dict too so save_episode rewrites preserve it.
+        # The mask marks the inert Dex3 hand slots (14) False over the 43-dim config so
+        # training action/state loss does not fit them to 0 and pollute the body dims.
+        import json as _json
+        import os as _os
+
+        from gear_sonic.data.features_sonic_vla import get_ee_descriptor
+
+        desc = get_ee_descriptor(config.end_effector)
+        num_joints = g1_rm.num_joints
+        hand_idx = set(g1_rm.get_joint_group_indices("left_hand")) | set(
+            g1_rm.get_joint_group_indices("right_hand")
+        )
+        mask = [i not in hand_idx for i in range(num_joints)]
+        data_exporter.info["ee_config"] = {
+            "type": desc["ee_type"],
+            "feature_prefix": desc["feature_prefix"],
+            "dims": len(desc["names"]),
+            "angle_range": list(desc["angle_range"]),
+            "action_mask": mask,
+            "state_mask": mask,
+        }
+        info_path = _os.path.join(
+            f"{config.root_output_dir}/{config.dataset_name}", "meta", "info.json"
+        )
+        with open(info_path, "w") as f:
+            _json.dump(data_exporter.info, f, indent=4)
+        n_masked = num_joints - sum(mask)
+        print(
+            f"[EE] info.json updated: ee_config.type={desc['ee_type']} "
+            f"dims={len(desc['names'])}; masked {n_masked}/{num_joints} hand slots"
+        )
 
     data_collector = GrootDataCollector(
         frequency=config.data_collection_frequency,
@@ -950,6 +1140,9 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        end_effector=config.end_effector,
+        ee_feedback_host=config.ee_feedback_host,
+        ee_feedback_port=config.ee_feedback_port,
     )
     data_collector.run()
 

@@ -26,6 +26,7 @@ from collections import defaultdict, deque
 from enum import Enum, IntEnum
 import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -734,6 +735,72 @@ def get_abxy_buttons():
         return False, False, False, False
 
 
+def read_controller_snapshot() -> dict:
+    """Read all Pico controller inputs once via xrt; return a snapshot dict.
+
+    Shared by ControllerReader (background) and the standalone fallback used when no
+    ControllerReader is wired in.
+    """
+    a, b, x, y = get_abxy_buttons()
+    left_menu, lt, rt, lg, rg = get_controller_inputs()
+    lx, ly, rx, ry = get_controller_axes()
+    lac, rac = get_axis_clicks()
+    return {
+        "a": a, "b": b, "x": x, "y": y,
+        "left_menu": left_menu,
+        "left_trigger": float(lt), "right_trigger": float(rt),
+        "left_grip": float(lg), "right_grip": float(rg),
+        "lx": lx, "ly": ly, "rx": rx, "ry": ry,
+        "left_axis_click": lac, "right_axis_click": rac,
+    }
+
+
+def controller_snapshot(reader: "ControllerReader | None") -> dict:
+    """Latest cached controller snapshot, or a fresh xrt read if no reader is wired in."""
+    return reader.get_latest() if reader is not None else read_controller_snapshot()
+
+
+class ControllerReader:
+    """Background reader for Pico controller inputs (buttons/axes/triggers/grips).
+
+    The xrt controller queries can intermittently block (RPC latency to the Pico
+    service), which stalls the teleop send loops and freezes the gripper target.
+    Polling all controller inputs in this dedicated thread and caching the latest
+    snapshot lets the pose/planner send loops run at a steady rate and read inputs
+    without making any xrt call themselves.
+    """
+
+    def __init__(self, poll_hz: int = 200):
+        self._stop = threading.Event()
+        self._period = 1.0 / max(1, poll_hz)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._lock = threading.Lock()
+        self._latest = read_controller_snapshot()
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def _run(self):
+        while not self._stop.is_set():
+            t0 = time.perf_counter()
+            try:
+                with self._lock:
+                    self._latest = read_controller_snapshot()
+            except Exception:
+                pass
+            remain = t0 + self._period - time.perf_counter()
+            if remain > 0:
+                time.sleep(remain)
+
+    def get_latest(self) -> dict:
+        with self._lock:
+            return dict(self._latest)
+
+
 def compute_hand_joints_from_inputs(
     left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1219,9 +1286,11 @@ class PoseStreamer:
         record_format: str,
         log_prefix: str = "PoseLoop",
         gripper_cfg: GripperCfg | None = None,
+        controller_reader: ControllerReader | None = None,
     ):
         self.socket = socket
         self.gripper_cfg = gripper_cfg or GripperCfg()
+        self.controller_reader = controller_reader
         self.reader = reader
         self.num_frames_to_send = num_frames_to_send
         self.target_fps = target_fps
@@ -1319,11 +1388,14 @@ class PoseStreamer:
         latest_data = compute_from_body_poses(
             self.parent_indices, self.device, sample["body_poses_np"]
         )
-        (left_menu_button, left_trigger, right_trigger, left_grip, right_grip) = (
-            get_controller_inputs()
-        )
+        _ctrl = controller_snapshot(self.controller_reader)
+        left_menu_button = _ctrl["left_menu"]
+        left_trigger, right_trigger = _ctrl["left_trigger"], _ctrl["right_trigger"]
+        left_grip, right_grip = _ctrl["left_grip"], _ctrl["right_grip"]
         # Get A and B button states for data collection control
-        a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+        a_pressed, b_pressed, x_pressed, y_pressed = (
+            _ctrl["a"], _ctrl["b"], _ctrl["x"], _ctrl["y"]
+        )
 
         # Data collection toggle logic (edge-triggered)
         # Left grip + A = toggle_data_collection
@@ -1352,6 +1424,16 @@ class PoseStreamer:
             r_gripper = self.gripper_cfg.target_right(right_trigger)
         else:
             l_gripper = r_gripper = 0.0
+
+        now_t = time.time()
+        if self.gripper_cfg.enabled and now_t >= getattr(self, "_gripper_log_next", 0.0):
+            print(
+                f"[Pose.send] t={now_t:.2f} "
+                f"L trig={left_trigger:.3f} norm={l_gripper:.3f} | "
+                f"R trig={right_trigger:.3f} norm={r_gripper:.3f}",
+                file=sys.stderr,
+            )
+            self._gripper_log_next = now_t + 0.5
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1480,9 +1562,8 @@ class PoseStreamer:
             # Buffer is now full with fresh data, can start sending
             self.buffer_cleared = False
 
-        # Get joystick axes for yaw accumulation
-        _, _, rx, _ = get_controller_axes()
-        self.yaw_accumulator.update(rx, self.frame_time)
+        # Get joystick axes for yaw accumulation (from cached controller snapshot)
+        self.yaw_accumulator.update(_ctrl["rx"], self.frame_time)
 
         # Only send if buffer is full and we're not waiting for fresh data
         if buffer_is_full and not self.buffer_cleared:
@@ -1681,11 +1762,13 @@ class PlannerStreamer:
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
         gripper_cfg: GripperCfg | None = None,
+        controller_reader: ControllerReader | None = None,
     ):
         self.socket = socket
         self.reader = reader
         self.three_point = three_point
         self.gripper_cfg = gripper_cfg or GripperCfg()
+        self.controller_reader = controller_reader
         self.feedback_reader = FeedbackReader(
             zmq_feedback_host=zmq_feedback_host, zmq_feedback_port=zmq_feedback_port
         )
@@ -1698,6 +1781,7 @@ class PlannerStreamer:
         # Persistent facing buffer (unit vector on XY plane)
         self.yaw_accumulator = YawAccumulator()
         self.last_send = time.time()
+        self._gripper_log_next = 0.0  # throttled log of sent gripper norm (diagnostic)
         self.last_xrt_timestamp = None
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
@@ -1740,17 +1824,15 @@ class PlannerStreamer:
                 return
             self.last_xrt_timestamp = xrt_timestamp
 
-            # A+B => next mode; X+Y => previous mode (rising edges)
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
-            # Read triggers/grips once for ALL planner modes (lifted out of the VR_3PT
-            # branch) so 2-finger gripper targets can be emitted in every mode.
-            (
-                _left_menu_button,
-                left_trigger,
-                right_trigger,
-                left_grip,
-                right_grip,
-            ) = get_controller_inputs()
+            # Read ALL controller inputs once from the cached snapshot (background
+            # ControllerReader) so an intermittent xrt stall doesn't freeze this loop.
+            _ctrl = controller_snapshot(self.controller_reader)
+            a_pressed, b_pressed, x_pressed, y_pressed = (
+                _ctrl["a"], _ctrl["b"], _ctrl["x"], _ctrl["y"]
+            )
+            # Triggers/grips for ALL planner modes (2-finger gripper targets).
+            left_trigger, right_trigger = _ctrl["left_trigger"], _ctrl["right_trigger"]
+            left_grip, right_grip = _ctrl["left_grip"], _ctrl["right_grip"]
             ab_now = bool(a_pressed) and bool(b_pressed)
             xy_now = bool(x_pressed) and bool(y_pressed)
             if ab_now and not self.prev_ab:
@@ -1763,7 +1845,7 @@ class PlannerStreamer:
             self.prev_xy = xy_now
 
             # Read axes/joysticks to control movement, facing, speed and mode
-            lx, ly, rx, ry = get_controller_axes()
+            lx, ly, rx, ry = _ctrl["lx"], _ctrl["ly"], _ctrl["rx"], _ctrl["ry"]
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -1837,6 +1919,16 @@ class PlannerStreamer:
                 r_gripper = self.gripper_cfg.target_right(right_trigger)
             else:
                 l_gripper = r_gripper = None
+
+            now_t = time.time()
+            if self.gripper_cfg.enabled and now_t >= self._gripper_log_next:
+                print(
+                    f"[Planner.send] t={now_t:.2f} "
+                    f"L trig={left_trigger:.3f} norm={l_gripper:.3f} | "
+                    f"R trig={right_trigger:.3f} norm={r_gripper:.3f}",
+                    file=sys.stderr,
+                )
+                self._gripper_log_next = now_t + 0.5
 
             msg = build_planner_message(
                 mode_to_send.value,
@@ -1940,6 +2032,12 @@ def run_pico_manager(
         invert_right=gripper_invert_right,
     )
 
+    # Background controller reader: caches button/axis/trigger values so the send
+    # loops never block on an xrt call (which can intermittently stall for seconds).
+    # 50Hz is fresh enough (planner consumes at 20Hz) without hammering the xrt RPC.
+    controller_reader = ControllerReader(poll_hz=50)
+    controller_reader.start()
+
     pose_streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -1951,6 +2049,7 @@ def run_pico_manager(
         record_format=record_format,
         log_prefix="PoseLoop",
         gripper_cfg=gripper_cfg,
+        controller_reader=controller_reader,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -1960,6 +2059,7 @@ def run_pico_manager(
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
         gripper_cfg=gripper_cfg,
+        controller_reader=controller_reader,
     )
 
     # State machine diagram:
@@ -1990,12 +2090,18 @@ def run_pico_manager(
         prev_start_combo = False
         prev_left_axis_click = False
         while True:
-            # Poll Pico controller for buttons/axes
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+            # Poll Pico controller for buttons/axes — from the cached snapshot produced
+            # by the background ControllerReader, so an intermittent xrt stall doesn't
+            # freeze the manager loop (and the gripper/pose/planner send rate).
+            _mctrl = controller_snapshot(controller_reader)
+            a_pressed, b_pressed, x_pressed, y_pressed = (
+                _mctrl["a"], _mctrl["b"], _mctrl["x"], _mctrl["y"]
+            )
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
+            left_menu_button = _mctrl["left_menu"]
+            left_grip_mgr = _mctrl["left_grip"]
 
-            left_axis_click, _ = get_axis_clicks()
+            left_axis_click = _mctrl["left_axis_click"]
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
@@ -2149,6 +2255,7 @@ def run_pico_manager(
         print("\nStopping manager...")
     finally:
         # Cleanup resources
+        controller_reader.stop()
         reader.stop()
         three_point.close()
         socket.close()

@@ -395,6 +395,69 @@ def get_wrist_camera_modality_config() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# End-effector (EE) descriptors
+# ---------------------------------------------------------------------------
+# Registry of supported end-effectors. Add new EEs here (dex3, o6_hand...).
+# - `feature_prefix`: the feature/modality key prefix (e.g. "gripper" -> action.gripper).
+#   Match community convention for the EE kind (gripper for 2-finger, hand for dexterous).
+# - `angle_range`: (open_deg, close_deg) with norm 0=open, 1=close; MUST match the
+#   robot-side driver (e.g. DM gripper_control_dmcan.py ANGLE_OPEN/ANGLE_CLOSE).
+_EE_DESCRIPTORS: dict[str, dict] = {
+    "dm_gripper": {
+        "ee_type": "dm_gripper",
+        "feature_prefix": "gripper",
+        "names": ["left", "right"],
+        "angle_range": (-150.0, -90.0),
+    },
+}
+
+
+def get_ee_descriptor(ee_type: str) -> dict:
+    """Return the descriptor for an end-effector type (raises if unknown)."""
+    if ee_type not in _EE_DESCRIPTORS:
+        raise ValueError(
+            f"Unknown end_effector '{ee_type}'; known: {list(_EE_DESCRIPTORS)}"
+        )
+    return _EE_DESCRIPTORS[ee_type]
+
+
+def get_ee_features(ee_type: str) -> dict:
+    """Optional EE features, added when ``--end-effector != none``.
+
+    Four features, each shape (num_sides,): desired/actual x normalized/angle.
+    For dm_gripper -> action.gripper / action.gripper_angle /
+    observation.gripper / observation.gripper_angle.
+    """
+    d = get_ee_descriptor(ee_type)
+    p = d["feature_prefix"]
+    names = d["names"]
+    n = len(names)
+    return {
+        f"action.{p}": {"dtype": "float32", "shape": (n,), "names": names},
+        f"action.{p}_angle": {"dtype": "float32", "shape": (n,), "names": names},
+        f"observation.{p}": {"dtype": "float32", "shape": (n,), "names": names},
+        f"observation.{p}_angle": {"dtype": "float32", "shape": (n,), "names": names},
+    }
+
+
+def get_ee_modality_config(ee_type: str) -> dict:
+    """Modality entries for EE features (deep-merged into the main modality config)."""
+    d = get_ee_descriptor(ee_type)
+    p = d["feature_prefix"]
+    n = len(d["names"])
+    return {
+        "action": {
+            p: {"start": 0, "end": n, "original_key": f"action.{p}"},
+            f"{p}_angle": {"start": 0, "end": n, "original_key": f"action.{p}_angle"},
+        },
+        "state": {
+            p: {"start": 0, "end": n, "original_key": f"observation.{p}"},
+            f"{p}_angle": {"start": 0, "end": n, "original_key": f"observation.{p}_angle"},
+        },
+    }
+
+
 def get_g1_robot_model(
     waist_location: Literal[
         "lower_body", "upper_body", "lower_and_upper_body"
